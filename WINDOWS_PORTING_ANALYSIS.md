@@ -1,10 +1,14 @@
-# Windows Compatibility Analysis: Porting Claude Squad to Zellij on Windows
+# Windows Compatibility Analysis: Porting Claude Squad to Windows
 
 ## Executive Summary
 
-Porting Claude Squad to Windows via Zellij would be a **major undertaking** due to two
-compounding factors: (1) Zellij itself lacks stable Windows support, and (2) the codebase
-has deep, unabstracted tmux coupling throughout.
+Two multiplexer backends were evaluated for Windows support:
+
+- **Zellij**: Major undertaking (~2-4 weeks). Zellij lacks stable Windows support and uses
+  a completely different API, requiring a full multiplexer abstraction layer.
+- **psmux** (Recommended): Small-to-medium effort (~3-5 days). psmux is a native Windows
+  tmux implementation in Rust that speaks the same tmux command language. Claude Squad's
+  `exec.Command("tmux", ...)` calls work as-is through psmux's `tmux` alias.
 
 ## Current Platform Dependencies
 
@@ -117,10 +121,87 @@ Zellij has a fundamentally different model:
 | **ConPTY native** (no multiplexer, direct Windows terminal) | Medium | No external dependency, but reimplements multiplexer features |
 | **Full Zellij Windows port** | Large | Targets an unstable platform |
 
+## psmux: The Better Path (Updated Analysis)
+
+### What is psmux?
+
+[psmux](https://github.com/psmux/psmux) is a native Windows terminal multiplexer built
+from scratch in Rust. It uses Windows ConPTY directly and speaks the **tmux command
+language** — 76 commands, 126+ format variables, `.tmux.conf` compatibility. It ships
+`tmux` and `pmux` aliases, so `exec.Command("tmux", ...)` works without code changes.
+
+Install via Scoop, Chocolatey, or `cargo install psmux`.
+
+### Command Compatibility with Claude Squad
+
+| Claude Squad Usage | tmux Command | psmux Support |
+|---|---|---|
+| Create session | `new-session -d -s <name> -c <dir>` | Yes |
+| Attach | `attach-session -t <name>` | Yes |
+| Kill session | `kill-session -t <name>` | Yes |
+| Capture output | `capture-pane -p -e -J -t <name>` | Yes |
+| Capture range | `capture-pane -p -e -J -S <start> -E <end>` | Yes |
+| Send input | `send-keys -t <name> <keys>` | Yes |
+| Set options | `set-option -t <name> history-limit/mouse` | Yes |
+| Check existence | `has-session -t=<name>` | Yes |
+| List sessions | `ls` | Yes |
+| Session cleanup | `kill-session -t <match>` | Yes |
+
+**All 10 tmux commands used by claude-squad are supported by psmux.**
+
+### What Needs to Change (psmux approach)
+
+#### 1. Replace `creack/pty` on Windows (~1-2 days)
+
+The primary blocker. `creack/pty` is Unix-only. The attach flow in `tmux.go` uses raw
+PTY for stdin/stdout forwarding. Options:
+- Use `github.com/aymanbagabas/go-pty` (cross-platform, supports ConPTY)
+- Build-tag split: `pty_unix.go` keeps `creack/pty`, `pty_windows.go` uses ConPTY
+- Refactor attach to use psmux's built-in attach (eliminates PTY dependency)
+
+#### 2. Platform Fixes (~1 day)
+
+- Shell detection: `$SHELL` doesn't exist on Windows; detect PowerShell/cmd
+- Config path: `os.UserHomeDir()` already works (`C:\Users\<name>`)
+- Git paths: `go-git` handles path separators, but verify worktree paths
+- Install script: Add PowerShell install script or Scoop manifest
+
+#### 3. Already Done
+
+- Signal handling: `tmux_windows.go` already polls instead of SIGWINCH
+- Daemon process: `daemon_windows.go` already uses `CREATE_NEW_PROCESS_GROUP`
+- TUI: BubbleTea is cross-platform
+- Git: go-git is cross-platform
+
+#### 4. Testing (~1-2 days)
+
+- Verify `capture-pane -p -e -J` output format matches tmux exactly
+- Test ANSI color handling in Windows Terminal
+- Validate session lifecycle with psmux
+- Test git worktree operations on NTFS
+
+### Estimated Effort: ~3-5 days
+
+| Task | Effort |
+|------|--------|
+| PTY replacement (build-tagged) | 1-2 days |
+| Platform fixes (shell, paths, install) | 1 day |
+| Testing & edge cases | 1-2 days |
+| **Total** | **3-5 days** |
+
+## Comparison of Approaches
+
+| Approach | Effort | Notes |
+|----------|--------|-------|
+| **psmux on Windows** | **~3-5 days** | Same tmux commands, native Windows, recommended |
+| WSL + tmux | Zero | Requires WSL installation |
+| Zellij on Windows | ~2-4 weeks | Different API, unstable Windows support |
+| ConPTY native (no multiplexer) | ~2 weeks | Reimplements multiplexer features |
+
 ## Conclusion
 
-The most pragmatic path for Windows users today is **WSL + tmux**. For long-term Windows
-support, creating a multiplexer abstraction interface is the right first step — it
-decouples the architecture from tmux and allows adding Zellij (or ConPTY-based) backends
-when they mature. Targeting Zellij on Windows specifically is premature given Zellij's own
-Windows support is still being merged.
+**psmux is the recommended path for Windows support.** Its tmux command compatibility
+means claude-squad's core logic works unchanged — the `tmux` binary on the PATH just
+happens to be psmux instead. The only significant work is replacing the Unix PTY layer
+with a Windows ConPTY equivalent, plus minor platform polish. This is a ~3-5 day effort
+versus ~2-4 weeks for a Zellij-based approach.
