@@ -101,56 +101,63 @@ func (h *conPtyHandle) SetSize(rows, cols uint16) error {
 type windowsPty struct{}
 
 func (p *windowsPty) Start(cmd *exec.Cmd) (PtyHandle, error) {
-	// Create pipes for ConPTY I/O. We use anonymous pipes.
-	var ptyInRead, ptyInWrite, ptyOutRead, ptyOutWrite windows.Handle
-	if err := windows.CreatePipe(&ptyInRead, &ptyInWrite, nil, 0); err != nil {
-		return nil, fmt.Errorf("CreatePipe (stdin): %w", err)
+	// Create pipes using os.Pipe() instead of windows.CreatePipe(). This is
+	// critical: os.Pipe() returns Go-managed *os.File handles that are
+	// properly integrated with the Go runtime's I/O poller (IOCP). Using
+	// windows.CreatePipe() + os.NewFile() creates synchronous handles that
+	// the runtime can't manage correctly, leading to blocked goroutines.
+	//
+	// Pipe layout:
+	//   ptyIn  (read)  → ConPTY stdin  ← inPipeW (write) [we write here]
+	//   ptyOut (write) → ConPTY stdout → outPipeR (read)  [we read here]
+	ptyIn, inPipeW, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("os.Pipe (stdin): %w", err)
 	}
-	if err := windows.CreatePipe(&ptyOutRead, &ptyOutWrite, nil, 0); err != nil {
-		windows.CloseHandle(ptyInRead)
-		windows.CloseHandle(ptyInWrite)
-		return nil, fmt.Errorf("CreatePipe (stdout): %w", err)
+	outPipeR, ptyOut, err := os.Pipe()
+	if err != nil {
+		ptyIn.Close()
+		inPipeW.Close()
+		return nil, fmt.Errorf("os.Pipe (stdout): %w", err)
 	}
 
 	// Create the pseudo console with a default 80x24 size.
 	// COORD is packed as X (cols) in low 16 bits, Y (rows) in high 16 bits.
 	coord := uintptr(80) | (uintptr(24) << 16)
 	var hPC windows.Handle
-	ret, _, err := procCreatePseudoConsole.Call(
+	ret, _, conErr := procCreatePseudoConsole.Call(
 		coord,
-		uintptr(ptyInRead),
-		uintptr(ptyOutWrite),
-		0, // flags: could use PSEUDOCONSOLE_INHERIT_CURSOR if needed
+		ptyIn.Fd(),
+		ptyOut.Fd(),
+		0, // flags: do NOT use PSEUDOCONSOLE_INHERIT_CURSOR (known hang bug)
 		uintptr(unsafe.Pointer(&hPC)),
 	)
 	if ret != 0 {
-		windows.CloseHandle(ptyInRead)
-		windows.CloseHandle(ptyInWrite)
-		windows.CloseHandle(ptyOutRead)
-		windows.CloseHandle(ptyOutWrite)
-		return nil, fmt.Errorf("CreatePseudoConsole failed (HRESULT 0x%08x): %w", ret, err)
+		ptyIn.Close()
+		inPipeW.Close()
+		outPipeR.Close()
+		ptyOut.Close()
+		return nil, fmt.Errorf("CreatePseudoConsole failed (HRESULT 0x%08x): %w", ret, conErr)
 	}
 
-	// ConPTY now owns the read-end of stdin and write-end of stdout.
-	// We must close our copies so we don't leak handles.
-	windows.CloseHandle(ptyInRead)
-	windows.CloseHandle(ptyOutWrite)
+	// ConPTY duplicates the pipe handles internally. Close the PTY-side ends
+	// now — ConPTY owns its copies. (This matches microsoft/hcsshim and
+	// aymanbagabas/go-pty patterns.)
+	ptyIn.Close()
+	ptyOut.Close()
 
 	// Start the process attached to the ConPTY.
 	hProc, err := startProcessWithConPty(cmd, hPC)
 	if err != nil {
-		windows.CloseHandle(ptyInWrite)
-		windows.CloseHandle(ptyOutRead)
+		inPipeW.Close()
+		outPipeR.Close()
 		procClosePseudoConsole.Call(uintptr(hPC))
 		return nil, err
 	}
 
-	// Wrap the raw handles in os.File. From this point, the os.File owns the
-	// handle and will CloseHandle when the file is closed. We must NOT call
-	// CloseHandle on these ourselves after this point.
 	return &conPtyHandle{
-		inPipe:  os.NewFile(uintptr(ptyInWrite), "|0"),
-		outPipe: os.NewFile(uintptr(ptyOutRead), "|1"),
+		inPipe:  inPipeW,
+		outPipe: outPipeR,
 		hPC:     hPC,
 		hProc:   hProc,
 	}, nil
@@ -229,6 +236,7 @@ func startProcessWithConPty(cmd *exec.Cmd, hPC windows.Handle) (windows.Handle, 
 	// Create the process with extended startup info.
 	si := &windows.StartupInfoEx{}
 	si.Cb = uint32(unsafe.Sizeof(*si))
+	si.Flags = windows.STARTF_USESTDHANDLES
 	si.ProcThreadAttributeList = (*windows.ProcThreadAttributeList)(attrListPtr)
 
 	var pi windows.ProcessInformation
