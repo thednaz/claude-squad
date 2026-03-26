@@ -175,8 +175,10 @@ func MakePtyFactory() PtyFactory {
 func startProcessWithConPty(cmd *exec.Cmd, hPC windows.Handle) (windows.Handle, error) {
 	// Determine attribute list size. The first call always "fails" (returns FALSE)
 	// but fills in the required size.
+	// InitializeProcThreadAttributeList(lpAttributeList, dwAttributeCount, dwFlags, lpSize)
+	// First call: lpAttributeList=NULL to query required size.
 	var attrListSize uintptr
-	procInitializeProcThreadAL.Call(0, 1, 0, 0, uintptr(unsafe.Pointer(&attrListSize)))
+	procInitializeProcThreadAL.Call(0, 1, 0, uintptr(unsafe.Pointer(&attrListSize)))
 	if attrListSize == 0 {
 		return 0, fmt.Errorf("InitializeProcThreadAttributeList returned zero size")
 	}
@@ -184,6 +186,7 @@ func startProcessWithConPty(cmd *exec.Cmd, hPC windows.Handle) (windows.Handle, 
 	attrList := make([]byte, attrListSize)
 	attrListPtr := unsafe.Pointer(&attrList[0])
 
+	// Second call: actually initialize with the allocated buffer.
 	ret, _, err := procInitializeProcThreadAL.Call(
 		uintptr(attrListPtr), 1, 0, uintptr(unsafe.Pointer(&attrListSize)),
 	)

@@ -31,12 +31,6 @@ func mockCmdExec(captureContent string, sessionExists bool) cmd_test.MockCmdExec
 	return cmd_test.MockCmdExec{
 		RunFunc: func(cmd *exec.Cmd) error {
 			cmdStr := cmd.String()
-			if strings.Contains(cmdStr, "has-session") {
-				if sessionExists {
-					return nil
-				}
-				return fmt.Errorf("session does not exist")
-			}
 			if strings.Contains(cmdStr, "new-session") {
 				return nil
 			}
@@ -49,6 +43,15 @@ func mockCmdExec(captureContent string, sessionExists bool) cmd_test.MockCmdExec
 			cmdStr := cmd.String()
 			if strings.Contains(cmdStr, "capture-pane") {
 				return []byte(captureContent), nil
+			}
+			// DoesSessionExist uses "tmux ls" — return empty when no sessions
+			if strings.Contains(cmdStr, "tmux") && strings.Contains(cmdStr, " ls") {
+				if sessionExists {
+					// Return a generic line — callers using injectSession don't
+					// call DoesSessionExist, so this is only a safety fallback.
+					return []byte("mock_session: 1 windows\n"), nil
+				}
+				return nil, fmt.Errorf("no server running")
 			}
 			return []byte(""), nil
 		},
@@ -65,15 +68,10 @@ func makeStartedInstance(t *testing.T, title string) *session.Instance {
 	sessionName := fmt.Sprintf("test-terminal-%s-%d-%d", title, time.Now().UnixNano(), random)
 
 	sessionCreated := false
+	tmuxName := tmux.TmuxPrefix + sessionName
 	cmdExec := cmd_test.MockCmdExec{
 		RunFunc: func(cmd *exec.Cmd) error {
 			cmdStr := cmd.String()
-			if strings.Contains(cmdStr, "has-session") {
-				if sessionCreated {
-					return nil
-				}
-				return fmt.Errorf("session does not exist")
-			}
 			if strings.Contains(cmdStr, "new-session") {
 				sessionCreated = true
 				return nil
@@ -81,6 +79,13 @@ func makeStartedInstance(t *testing.T, title string) *session.Instance {
 			return nil
 		},
 		OutputFunc: func(cmd *exec.Cmd) ([]byte, error) {
+			cmdStr := cmd.String()
+			if strings.Contains(cmdStr, "tmux ls") {
+				if sessionCreated {
+					return []byte(fmt.Sprintf("%s: 1 windows\n", tmuxName)), nil
+				}
+				return nil, fmt.Errorf("no server running")
+			}
 			return []byte(""), nil
 		},
 	}

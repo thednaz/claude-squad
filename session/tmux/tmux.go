@@ -449,9 +449,22 @@ func (t *TmuxSession) updateWindowSize(cols, rows int) error {
 }
 
 func (t *TmuxSession) DoesSessionExist() bool {
-	// Using "-t name" does a prefix match, which is wrong. `-t=` does an exact match.
-	existsCmd := exec.Command("tmux", "has-session", fmt.Sprintf("-t=%s", t.sanitizedName))
-	return t.cmdExec.Run(existsCmd) == nil
+	// We use "tmux ls" and match the name instead of "has-session -t=name"
+	// because psmux (Windows tmux) does not implement exact match for
+	// has-session — it returns success if *any* session exists.
+	lsCmd := exec.Command("tmux", "ls")
+	output, err := t.cmdExec.Output(lsCmd)
+	if err != nil {
+		return false
+	}
+	// tmux ls format: "name: N windows (created ...)"
+	for _, line := range strings.Split(string(output), "\n") {
+		parts := strings.SplitN(line, ":", 2)
+		if len(parts) >= 2 && strings.TrimSpace(parts[0]) == t.sanitizedName {
+			return true
+		}
+	}
+	return false
 }
 
 // CapturePaneContent captures the content of the tmux pane

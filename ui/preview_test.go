@@ -139,23 +139,20 @@ func TestPreviewScrolling(t *testing.T) {
 	fullContent := strings.Join(lines, "\n")
 
 	// Mock command execution
+	var createdSessionName string
 	cmdExec := cmd_test.MockCmdExec{
 		RunFunc: func(cmd *exec.Cmd) error {
 			cmdStr := cmd.String()
 			executedCommands = append(executedCommands, cmdStr)
 
-			// Handle tmux session creation and existence checking
-			if strings.Contains(cmdStr, "has-session") {
-				if sessionCreated {
-					return nil // Session exists
-				} else {
-					return fmt.Errorf("session does not exist")
-				}
-			}
-
-			// Handle session creation
+			// Handle session creation — capture the session name from args
 			if strings.Contains(cmdStr, "new-session") {
 				sessionCreated = true
+				for i, arg := range cmd.Args {
+					if arg == "-s" && i+1 < len(cmd.Args) {
+						createdSessionName = cmd.Args[i+1]
+					}
+				}
 				return nil
 			}
 
@@ -187,6 +184,14 @@ func TestPreviewScrolling(t *testing.T) {
 		},
 		OutputFunc: func(cmd *exec.Cmd) ([]byte, error) {
 			cmdStr := cmd.String()
+
+			// Handle tmux ls for DoesSessionExist
+			if strings.Contains(cmdStr, "tmux ls") || strings.Contains(cmdStr, "tmux.exe ls") {
+				if sessionCreated && createdSessionName != "" {
+					return []byte(fmt.Sprintf("%s: 1 windows\n", createdSessionName)), nil
+				}
+				return nil, fmt.Errorf("no server running")
+			}
 
 			// Handle capture-pane commands
 			if strings.Contains(cmdStr, "capture-pane") {
@@ -328,24 +333,21 @@ func TestPreviewContentWithoutScrolling(t *testing.T) {
 
 	// Track session creation state
 	sessionCreated := false
+	var createdSessionName string
 
 	// Mock command execution
 	cmdExec := cmd_test.MockCmdExec{
 		RunFunc: func(cmd *exec.Cmd) error {
 			cmdStr := cmd.String()
 
-			// Handle tmux session creation and existence checking
-			if strings.Contains(cmdStr, "has-session") {
-				if sessionCreated {
-					return nil // Session exists
-				} else {
-					return fmt.Errorf("session does not exist")
-				}
-			}
-
 			// Handle session creation
 			if strings.Contains(cmdStr, "new-session") {
 				sessionCreated = true
+				for i, arg := range cmd.Args {
+					if arg == "-s" && i+1 < len(cmd.Args) {
+						createdSessionName = cmd.Args[i+1]
+					}
+				}
 				return nil
 			}
 
@@ -353,6 +355,14 @@ func TestPreviewContentWithoutScrolling(t *testing.T) {
 		},
 		OutputFunc: func(cmd *exec.Cmd) ([]byte, error) {
 			cmdStr := cmd.String()
+
+			// Handle tmux ls for DoesSessionExist
+			if strings.Contains(cmdStr, "tmux ls") || strings.Contains(cmdStr, "tmux.exe ls") {
+				if sessionCreated && createdSessionName != "" {
+					return []byte(fmt.Sprintf("%s: 1 windows\n", createdSessionName)), nil
+				}
+				return nil, fmt.Errorf("no server running")
+			}
 
 			// Handle capture-pane commands for normal preview
 			if strings.Contains(cmdStr, "capture-pane") {

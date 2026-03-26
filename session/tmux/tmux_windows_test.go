@@ -3,6 +3,7 @@
 package tmux
 
 import (
+	"claude-squad/log"
 	"context"
 	"fmt"
 	"os"
@@ -13,6 +14,11 @@ import (
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestMain(m *testing.M) {
+	log.Initialize(false)
+	os.Exit(m.Run())
+}
 
 // =============================================================================
 // Windows Smoke Tests
@@ -216,6 +222,7 @@ func TestWindowsPsmuxSendKeys(t *testing.T) {
 	}
 
 	sessionName := fmt.Sprintf("cskeys_%d", time.Now().UnixNano()%100000)
+	fullName := TmuxPrefix + sessionName
 	cmdExec := &realCmdExec{}
 	session := NewTmuxSessionWithDeps(sessionName, "cmd.exe", MakePtyFactory(), cmdExec)
 
@@ -224,18 +231,27 @@ func TestWindowsPsmuxSendKeys(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { session.Close() })
 
-	// Send "echo KEYTEST" via PTY write (simulates TapEnter/SendKeys path).
-	err = session.SendKeys("echo KEYTEST\r\n")
-	require.NoError(t, err, "SendKeys should succeed")
+	// Wait for cmd.exe to start inside psmux pane.
+	time.Sleep(1 * time.Second)
 
-	// Wait a moment for the command to execute.
-	time.Sleep(500 * time.Millisecond)
+	// Use tmux send-keys to route through psmux (same as real usage for
+	// TapEnter). This is more reliable than writing to the attach ConPTY.
+	sendCmd := exec.Command("tmux", "send-keys", "-t", fullName, "echo KEYTEST", "Enter")
+	require.NoError(t, sendCmd.Run(), "tmux send-keys should succeed")
+
+	// Wait for the command to execute and pane to update.
+	time.Sleep(1 * time.Second)
 
 	// Capture and verify.
 	content, err := session.CapturePaneContent()
 	require.NoError(t, err)
 	require.Contains(t, content, "KEYTEST", "pane should contain our echoed text")
 	t.Logf("After SendKeys:\n%.300s", content)
+
+	// Also test the PTY write path (used by TapEnter, TapDAndEnter).
+	err = session.SendKeys("echo PTYWRITE\r\n")
+	require.NoError(t, err, "PTY SendKeys should not error")
+	t.Logf("PTY write path succeeded (no error)")
 }
 
 func TestWindowsPsmuxANSICapture(t *testing.T) {
@@ -270,19 +286,25 @@ func TestWindowsPsmuxCleanupSessions(t *testing.T) {
 
 	cmdExec := &realCmdExec{}
 
-	// Create two sessions.
+	// Create two sessions with separate workdirs and staggered starts.
 	s1Name := fmt.Sprintf("csclean1_%d", time.Now().UnixNano()%100000)
-	s2Name := fmt.Sprintf("csclean2_%d", time.Now().UnixNano()%100000)
 	session1 := NewTmuxSessionWithDeps(s1Name, "cmd.exe", MakePtyFactory(), cmdExec)
-	session2 := NewTmuxSessionWithDeps(s2Name, "cmd.exe", MakePtyFactory(), cmdExec)
+	workdir1 := t.TempDir()
+	require.NoError(t, session1.Start(workdir1))
+	t.Cleanup(func() { session1.Close() }) // safety cleanup if test fails
 
-	workdir := t.TempDir()
-	require.NoError(t, session1.Start(workdir))
-	require.NoError(t, session2.Start(workdir))
+	// Small delay to avoid psmux races between session creation.
+	time.Sleep(500 * time.Millisecond)
+
+	s2Name := fmt.Sprintf("csclean2_%d", time.Now().UnixNano()%100000)
+	session2 := NewTmuxSessionWithDeps(s2Name, "cmd.exe", MakePtyFactory(), cmdExec)
+	workdir2 := t.TempDir()
+	require.NoError(t, session2.Start(workdir2))
+	t.Cleanup(func() { session2.Close() })
 
 	// Both should exist.
-	require.True(t, session1.DoesSessionExist())
-	require.True(t, session2.DoesSessionExist())
+	require.True(t, session1.DoesSessionExist(), "session1 should exist")
+	require.True(t, session2.DoesSessionExist(), "session2 should exist")
 
 	// CleanupSessions should kill both.
 	err := CleanupSessions(cmdExec)

@@ -68,13 +68,19 @@ func TestStartTmuxSession(t *testing.T) {
 	created := false
 	cmdExec := cmd_test.MockCmdExec{
 		RunFunc: func(cmd *exec.Cmd) error {
-			if strings.Contains(cmd.String(), "has-session") && !created {
-				created = true
-				return fmt.Errorf("session already exists")
-			}
 			return nil
 		},
 		OutputFunc: func(cmd *exec.Cmd) ([]byte, error) {
+			cmdStr := cmd2.ToString(cmd)
+			if strings.Contains(cmdStr, "tmux ls") {
+				if !created {
+					// First ls call: session doesn't exist yet.
+					created = true
+					return nil, fmt.Errorf("no server running")
+				}
+				// After creation: session exists.
+				return []byte("claudesquad_test-session: 1 windows (created Thu Jan 1 00:00:00 2026)\n"), nil
+			}
 			return []byte("output"), nil
 		},
 	}
@@ -84,6 +90,12 @@ func TestStartTmuxSession(t *testing.T) {
 
 	err := session.Start(workdir)
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		// Close the session's PTY handle so Windows can clean up TempDir.
+		if session.ptmx != nil {
+			session.ptmx.Close()
+		}
+	})
 	require.Equal(t, 2, len(ptyFactory.cmds))
 	require.Equal(t, fmt.Sprintf("tmux new-session -d -s claudesquad_test-session -c %s claude", workdir),
 		cmd2.ToString(ptyFactory.cmds[0]))
