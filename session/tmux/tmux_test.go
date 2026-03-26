@@ -15,22 +15,35 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// mockPtyHandle wraps an *os.File to implement PtyHandle for testing.
+type mockPtyHandle struct {
+	*os.File
+}
+
+func (m *mockPtyHandle) SetSize(rows, cols uint16) error {
+	return nil
+}
+
 type MockPtyFactory struct {
 	t *testing.T
 
 	// Array of commands and the corresponding file handles representing PTYs.
-	cmds  []*exec.Cmd
-	files []*os.File
+	cmds    []*exec.Cmd
+	files   []*os.File
+	handles []PtyHandle
 }
 
-func (pt *MockPtyFactory) Start(cmd *exec.Cmd) (*os.File, error) {
+func (pt *MockPtyFactory) Start(cmd *exec.Cmd) (PtyHandle, error) {
 	filePath := filepath.Join(pt.t.TempDir(), fmt.Sprintf("pty-%s-%d", pt.t.Name(), rand.Int31()))
 	f, err := os.OpenFile(filePath, os.O_CREATE|os.O_RDWR, 0644)
-	if err == nil {
-		pt.cmds = append(pt.cmds, cmd)
-		pt.files = append(pt.files, f)
+	if err != nil {
+		return nil, err
 	}
-	return f, err
+	h := &mockPtyHandle{File: f}
+	pt.cmds = append(pt.cmds, cmd)
+	pt.files = append(pt.files, f)
+	pt.handles = append(pt.handles, h)
+	return h, nil
 }
 
 func (pt *MockPtyFactory) Close() {}

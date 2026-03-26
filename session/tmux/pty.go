@@ -1,26 +1,21 @@
 package tmux
 
 import (
-	"os"
+	"io"
 	"os/exec"
-
-	"github.com/creack/pty"
 )
 
+// PtyHandle represents a handle to a pseudo-terminal that supports reading,
+// writing, closing, and resizing. On Unix this is backed by a PTY master fd
+// from creack/pty. On Windows this wraps a ConPTY with separate I/O pipes.
+type PtyHandle interface {
+	io.ReadWriteCloser
+	// SetSize resizes the pseudo-terminal to the given dimensions.
+	SetSize(rows, cols uint16) error
+}
+
+// PtyFactory creates pseudo-terminals for running commands.
 type PtyFactory interface {
-	Start(cmd *exec.Cmd) (*os.File, error)
+	Start(cmd *exec.Cmd) (PtyHandle, error)
 	Close()
-}
-
-// Pty starts a "real" pseudo-terminal (PTY) using the creack/pty package.
-type Pty struct{}
-
-func (pt Pty) Start(cmd *exec.Cmd) (*os.File, error) {
-	return pty.Start(cmd)
-}
-
-func (pt Pty) Close() {}
-
-func MakePtyFactory() PtyFactory {
-	return Pty{}
 }

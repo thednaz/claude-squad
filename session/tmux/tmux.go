@@ -15,8 +15,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/creack/pty"
 )
 
 const ProgramClaude = "claude"
@@ -38,10 +36,10 @@ type TmuxSession struct {
 
 	// Initialized by Start or Restore
 	//
-	// ptmx is a PTY is running the tmux attach command. This can be resized to change the
+	// ptmx is a PTY running the tmux attach command. This can be resized to change the
 	// stdout dimensions of the tmux pane. On detach, we close it and set a new one.
 	// This should never be nil.
-	ptmx *os.File
+	ptmx PtyHandle
 	// monitor monitors the tmux pane content and sends signals to the UI when it's status changes
 	monitor *statusMonitor
 
@@ -447,12 +445,7 @@ func (t *TmuxSession) SetDetachedSize(width, height int) error {
 
 // updateWindowSize updates the window size of the PTY.
 func (t *TmuxSession) updateWindowSize(cols, rows int) error {
-	return pty.Setsize(t.ptmx, &pty.Winsize{
-		Rows: uint16(rows),
-		Cols: uint16(cols),
-		X:    0,
-		Y:    0,
-	})
+	return t.ptmx.SetSize(uint16(rows), uint16(cols))
 }
 
 func (t *TmuxSession) DoesSessionExist() bool {
