@@ -8,7 +8,6 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
-	"regexp"
 	"strings"
 )
 
@@ -106,44 +105,18 @@ func DefaultConfig() *Config {
 
 // GetClaudeCommand attempts to find the "claude" command in the user's shell
 // It checks in the following order:
-// 1. Shell alias resolution: using "which" command
-// 2. PATH lookup
+// 1. Platform-specific shell resolution (alias/profile on Unix, "where" on Windows)
+// 2. PATH lookup via exec.LookPath
 //
 // If both fail, it returns an error.
 func GetClaudeCommand() (string, error) {
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/bash" // Default to bash if SHELL is not set
+	// Try platform-specific shell resolution first.
+	path, err := getClaudeViaShell()
+	if err == nil && path != "" {
+		return path, nil
 	}
 
-	// Force the shell to load the user's profile and then run the command
-	// For zsh, source .zshrc; for bash, source .bashrc
-	var shellCmd string
-	if strings.Contains(shell, "zsh") {
-		shellCmd = "source ~/.zshrc &>/dev/null || true; which claude"
-	} else if strings.Contains(shell, "bash") {
-		shellCmd = "source ~/.bashrc &>/dev/null || true; which claude"
-	} else {
-		shellCmd = "which claude"
-	}
-
-	cmd := exec.Command(shell, "-c", shellCmd)
-	output, err := cmd.Output()
-	if err == nil && len(output) > 0 {
-		path := strings.TrimSpace(string(output))
-		if path != "" {
-			// Check if the output is an alias definition and extract the actual path
-			// Handle formats like "claude: aliased to /path/to/claude" or other shell-specific formats
-			aliasRegex := regexp.MustCompile(`(?:aliased to|->|=)\s*([^\s]+)`)
-			matches := aliasRegex.FindStringSubmatch(path)
-			if len(matches) > 1 {
-				path = matches[1]
-			}
-			return path, nil
-		}
-	}
-
-	// Otherwise, try to find in PATH directly
+	// Otherwise, try to find in PATH directly.
 	claudePath, err := exec.LookPath("claude")
 	if err == nil {
 		return claudePath, nil

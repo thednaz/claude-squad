@@ -1,11 +1,11 @@
 package ui
 
 import (
+	"claude-squad/config"
 	"claude-squad/log"
 	"claude-squad/session"
 	"claude-squad/session/tmux"
 	"fmt"
-	"os"
 	"strings"
 	"sync"
 
@@ -143,10 +143,7 @@ func (t *TerminalPane) ensureSessionLocked(instance *session.Instance) error {
 		delete(t.sessions, instance.Title)
 	}
 
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/sh"
-	}
+	shell := config.DefaultShell()
 
 	termName := "term_" + instance.Title
 	ts := tmux.NewTmuxSession(termName, shell)

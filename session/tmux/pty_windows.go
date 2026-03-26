@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"sync"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
@@ -24,10 +25,16 @@ var (
 const _PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE = 0x00020016
 
 // conPtyHandle wraps a Windows ConPTY with I/O pipes.
+//
+// Close ordering matters: the ConPTY handle must be closed BEFORE the I/O
+// pipes, otherwise reads on outPipe will block forever waiting for EOF.
 type conPtyHandle struct {
 	inPipe  *os.File       // write to this to send input to the process
 	outPipe *os.File       // read from this to get process output
 	hPC     windows.Handle // pseudo console handle
+	hProc   windows.Handle // process handle for wait/kill support
+
+	closeOnce sync.Once
 }
 
 func (h *conPtyHandle) Read(p []byte) (int, error) {
@@ -38,26 +45,49 @@ func (h *conPtyHandle) Write(p []byte) (int, error) {
 	return h.inPipe.Write(p)
 }
 
+// Close tears down the ConPTY and its I/O pipes. It is safe to call multiple
+// times. The ordering is critical:
+//  1. Close the ConPTY handle — this signals EOF to the output pipe.
+//  2. Close the input pipe.
+//  3. Close the output pipe (reads will now return EOF).
 func (h *conPtyHandle) Close() error {
 	var firstErr error
-	if h.inPipe != nil {
-		if err := h.inPipe.Close(); err != nil && firstErr == nil {
-			firstErr = err
+	h.closeOnce.Do(func() {
+		// Step 1: Close ConPTY handle first so the output pipe gets EOF.
+		if h.hPC != 0 {
+			procClosePseudoConsole.Call(uintptr(h.hPC))
+			h.hPC = 0
 		}
-	}
-	if h.outPipe != nil {
-		if err := h.outPipe.Close(); err != nil && firstErr == nil {
-			firstErr = err
+
+		// Step 2: Close input pipe.
+		if h.inPipe != nil {
+			if err := h.inPipe.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			h.inPipe = nil
 		}
-	}
-	if h.hPC != 0 {
-		procClosePseudoConsole.Call(uintptr(h.hPC))
-		h.hPC = 0
-	}
+
+		// Step 3: Close output pipe.
+		if h.outPipe != nil {
+			if err := h.outPipe.Close(); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			h.outPipe = nil
+		}
+
+		// Step 4: Close the process handle.
+		if h.hProc != 0 {
+			windows.CloseHandle(h.hProc)
+			h.hProc = 0
+		}
+	})
 	return firstErr
 }
 
 func (h *conPtyHandle) SetSize(rows, cols uint16) error {
+	if h.hPC == 0 {
+		return fmt.Errorf("ConPTY handle is closed")
+	}
 	// COORD is packed as two int16 values: X (cols), Y (rows).
 	coord := uintptr(cols) | (uintptr(rows) << 16)
 	ret, _, err := procResizePseudoConsole.Call(uintptr(h.hPC), coord)
@@ -71,7 +101,7 @@ func (h *conPtyHandle) SetSize(rows, cols uint16) error {
 type windowsPty struct{}
 
 func (p *windowsPty) Start(cmd *exec.Cmd) (PtyHandle, error) {
-	// Create pipes for ConPTY I/O.
+	// Create pipes for ConPTY I/O. We use anonymous pipes.
 	var ptyInRead, ptyInWrite, ptyOutRead, ptyOutWrite windows.Handle
 	if err := windows.CreatePipe(&ptyInRead, &ptyInWrite, nil, 0); err != nil {
 		return nil, fmt.Errorf("CreatePipe (stdin): %w", err)
@@ -83,13 +113,14 @@ func (p *windowsPty) Start(cmd *exec.Cmd) (PtyHandle, error) {
 	}
 
 	// Create the pseudo console with a default 80x24 size.
-	coord := uintptr(80) | (uintptr(24) << 16) // COORD{X:80, Y:24}
+	// COORD is packed as X (cols) in low 16 bits, Y (rows) in high 16 bits.
+	coord := uintptr(80) | (uintptr(24) << 16)
 	var hPC windows.Handle
 	ret, _, err := procCreatePseudoConsole.Call(
 		coord,
 		uintptr(ptyInRead),
 		uintptr(ptyOutWrite),
-		0,
+		0, // flags: could use PSEUDOCONSOLE_INHERIT_CURSOR if needed
 		uintptr(unsafe.Pointer(&hPC)),
 	)
 	if ret != 0 {
@@ -97,25 +128,31 @@ func (p *windowsPty) Start(cmd *exec.Cmd) (PtyHandle, error) {
 		windows.CloseHandle(ptyInWrite)
 		windows.CloseHandle(ptyOutRead)
 		windows.CloseHandle(ptyOutWrite)
-		return nil, fmt.Errorf("CreatePseudoConsole failed: %w", err)
+		return nil, fmt.Errorf("CreatePseudoConsole failed (HRESULT 0x%08x): %w", ret, err)
 	}
 
-	// ConPTY now owns these pipe ends; close our copies.
+	// ConPTY now owns the read-end of stdin and write-end of stdout.
+	// We must close our copies so we don't leak handles.
 	windows.CloseHandle(ptyInRead)
 	windows.CloseHandle(ptyOutWrite)
 
-	// Set up the process with the pseudo console attribute.
-	if err := startProcessWithConPty(cmd, hPC); err != nil {
+	// Start the process attached to the ConPTY.
+	hProc, err := startProcessWithConPty(cmd, hPC)
+	if err != nil {
 		windows.CloseHandle(ptyInWrite)
 		windows.CloseHandle(ptyOutRead)
 		procClosePseudoConsole.Call(uintptr(hPC))
 		return nil, err
 	}
 
+	// Wrap the raw handles in os.File. From this point, the os.File owns the
+	// handle and will CloseHandle when the file is closed. We must NOT call
+	// CloseHandle on these ourselves after this point.
 	return &conPtyHandle{
-		inPipe:  os.NewFile(uintptr(ptyInWrite), "conpty-in"),
-		outPipe: os.NewFile(uintptr(ptyOutRead), "conpty-out"),
+		inPipe:  os.NewFile(uintptr(ptyInWrite), "|0"),
+		outPipe: os.NewFile(uintptr(ptyOutRead), "|1"),
 		hPC:     hPC,
+		hProc:   hProc,
 	}, nil
 }
 
@@ -127,12 +164,14 @@ func MakePtyFactory() PtyFactory {
 }
 
 // startProcessWithConPty starts a process attached to the given ConPTY handle.
-func startProcessWithConPty(cmd *exec.Cmd, hPC windows.Handle) error {
-	// Determine attribute list size.
+// It returns the process handle so the caller can manage its lifecycle.
+func startProcessWithConPty(cmd *exec.Cmd, hPC windows.Handle) (windows.Handle, error) {
+	// Determine attribute list size. The first call always "fails" (returns FALSE)
+	// but fills in the required size.
 	var attrListSize uintptr
 	procInitializeProcThreadAL.Call(0, 1, 0, 0, uintptr(unsafe.Pointer(&attrListSize)))
 	if attrListSize == 0 {
-		return fmt.Errorf("InitializeProcThreadAttributeList returned zero size")
+		return 0, fmt.Errorf("InitializeProcThreadAttributeList returned zero size")
 	}
 
 	attrList := make([]byte, attrListSize)
@@ -142,7 +181,7 @@ func startProcessWithConPty(cmd *exec.Cmd, hPC windows.Handle) error {
 		uintptr(attrListPtr), 1, 0, uintptr(unsafe.Pointer(&attrListSize)),
 	)
 	if ret == 0 {
-		return fmt.Errorf("InitializeProcThreadAttributeList: %w", err)
+		return 0, fmt.Errorf("InitializeProcThreadAttributeList: %w", err)
 	}
 	defer procDeleteProcThreadAL.Call(uintptr(attrListPtr))
 
@@ -156,26 +195,35 @@ func startProcessWithConPty(cmd *exec.Cmd, hPC windows.Handle) error {
 		0, 0,
 	)
 	if ret == 0 {
-		return fmt.Errorf("UpdateProcThreadAttribute: %w", err)
+		return 0, fmt.Errorf("UpdateProcThreadAttribute: %w", err)
 	}
 
-	// Build the command line string.
-	cmdLine := cmd.Path
-	if len(cmd.Args) > 1 {
-		cmdLine = windows.ComposeCommandLine(cmd.Args)
+	// Build the command line. exec.Cmd populates Args[0] with Path, so we
+	// always use the full Args slice for ComposeCommandLine.
+	args := cmd.Args
+	if len(args) == 0 {
+		args = []string{cmd.Path}
 	}
+	cmdLine := windows.ComposeCommandLine(args)
 	cmdLinePtr, err := windows.UTF16PtrFromString(cmdLine)
 	if err != nil {
-		return err
+		return 0, err
 	}
 
 	var dirPtr *uint16
-	dir := cmd.Dir
-	if dir != "" {
-		dirPtr, err = windows.UTF16PtrFromString(dir)
+	if cmd.Dir != "" {
+		dirPtr, err = windows.UTF16PtrFromString(cmd.Dir)
 		if err != nil {
-			return err
+			return 0, err
 		}
+	}
+
+	// Build environment block if cmd.Env is set.
+	var envBlock *uint16
+	createFlags := uint32(windows.EXTENDED_STARTUPINFO_PRESENT)
+	if len(cmd.Env) > 0 {
+		envBlock = createEnvBlock(cmd.Env)
+		createFlags |= windows.CREATE_UNICODE_ENVIRONMENT
 	}
 
 	// Create the process with extended startup info.
@@ -184,31 +232,44 @@ func startProcessWithConPty(cmd *exec.Cmd, hPC windows.Handle) error {
 	si.ProcThreadAttributeList = (*windows.ProcThreadAttributeList)(attrListPtr)
 
 	var pi windows.ProcessInformation
-	createFlags := uint32(windows.EXTENDED_STARTUPINFO_PRESENT)
-
 	err = windows.CreateProcess(
 		nil,
 		cmdLinePtr,
 		nil, nil,
 		false,
 		createFlags,
-		nil, // inherit environment
+		envBlock,
 		dirPtr,
 		&si.StartupInfo,
 		&pi,
 	)
 	if err != nil {
-		return fmt.Errorf("CreateProcess: %w", err)
+		return 0, fmt.Errorf("CreateProcess: %w", err)
 	}
 
 	// Close the thread handle; we don't need it.
 	windows.CloseHandle(pi.Thread)
-	windows.CloseHandle(pi.Process)
 
-	// Store the process for cmd if possible (for wait/kill support).
-	if cmd.Process == nil {
-		cmd.Process, _ = os.FindProcess(int(pi.ProcessId))
+	// Wire the process into cmd.Process so callers can use cmd.Process.Kill()
+	// and cmd.Process.Wait(). os.FindProcess on Windows does not open a new
+	// handle — it just wraps the PID. We keep hProc for our own lifecycle
+	// management.
+	cmd.Process, _ = os.FindProcess(int(pi.ProcessId))
+
+	return pi.Process, nil
+}
+
+// createEnvBlock builds a Windows environment block (null-terminated strings,
+// double-null terminated) from a string slice.
+func createEnvBlock(env []string) *uint16 {
+	if len(env) == 0 {
+		return nil
 	}
-
-	return nil
+	var block []uint16
+	for _, s := range env {
+		u := windows.StringToUTF16(s)
+		block = append(block, u...)
+	}
+	block = append(block, 0) // double null terminator
+	return &block[0]
 }
